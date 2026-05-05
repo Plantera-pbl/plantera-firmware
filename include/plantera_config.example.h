@@ -22,7 +22,7 @@ constexpr uint8_t DHT_TYPE = DHT22;
 constexpr uint8_t LIGHT_SENSOR_PIN = 0;
 constexpr uint8_t SOIL_SENSOR_PIN = 1;
 constexpr uint8_t PUMP_PIN = 7;
-constexpr uint8_t GROW_LIGHT_PIN = 8;
+constexpr uint8_t GROW_LIGHT_PIN = 3;
 constexpr uint8_t FAN_PIN = 10;
 
 constexpr uint8_t ACTUATOR_ON_LEVEL = HIGH;
