@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <DHT.h>
 
 // Copy this file to include/plantera_config.h for local credentials or pin changes.
 // The real plantera_config.h file is gitignored so WiFi secrets are not committed.
@@ -9,6 +10,7 @@ constexpr char DEVICE_ID[] = "plantera-pot-001";
 
 constexpr char WIFI_SSID[] = "";
 constexpr char WIFI_PASSWORD[] = "";
+constexpr bool FORCE_LOCAL_MODE = false;
 
 // Example: "http://192.168.1.50:3000/api/devices/plantera-pot-001".
 // Leave empty to keep the firmware in local autonomous mode.
