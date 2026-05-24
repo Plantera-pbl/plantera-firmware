@@ -37,12 +37,32 @@ constexpr int PUMP_PWM_RUN_DUTY = 255; // Full power for pump testing.
 constexpr int PUMP_PWM_RAMP_STEP = 16;
 constexpr int PUMP_PWM_RAMP_DELAY_MS = 40;
 constexpr int ADC_MAX = 4095;
+constexpr int LIGHT_SAMPLES = 8;
 constexpr int SOIL_MOISTURE_SAMPLES = 10;
 constexpr int SOIL_STABLE_DELTA_RAW = 61; // About 1.5% of the 12-bit ADC range.
 constexpr int SOIL_STABLE_REQUIRED_READINGS = 3;
+constexpr unsigned long SENSOR_WARMUP_MS = 15000;
+constexpr int SENSOR_MIN_VALID_SAMPLES = 3;
+constexpr float SENSOR_SMOOTHING_ALPHA = 0.35f;
+constexpr float SENSOR_MAX_PERCENT_STEP = 35.0f;
+constexpr float SOIL_MIN_TRUSTED_PERCENT = 1.0f;
+constexpr int SOIL_MIN_VALID_RAW = 20;
+constexpr int SOIL_MAX_VALID_RAW = ADC_MAX - 20;
+constexpr float DHT_MIN_TEMPERATURE_C = -20.0f;
+constexpr float DHT_MAX_TEMPERATURE_C = 80.0f;
+constexpr float DHT_MIN_HUMIDITY_PERCENT = 0.0f;
+constexpr float DHT_MAX_HUMIDITY_PERCENT = 100.0f;
 constexpr float PUMP_SOIL_THRESHOLD_PERCENT = 40.0f;
 constexpr float FAN_HUMIDITY_THRESHOLD_PERCENT = 60.0f;
 constexpr float LED_BOARD_LIGHT_THRESHOLD_PERCENT = 90.0f;
+
+struct SensorValueState {
+  float smoothedValue = NAN;
+  float lastAcceptedValue = NAN;
+  uint16_t acceptedSamples = 0;
+  bool valid = false;
+  const char *status = "warming_up";
+};
 
 DHT dht(DHT_PIN, DHT_TYPE);
 WiFiClientSecure wifiClient;
@@ -52,15 +72,127 @@ unsigned long lastDhtMs = 0;
 unsigned long lastSoilMoistureMs = 0;
 unsigned long lastMqttPublishMs = 0;
 int soilMoistureRaw = -1;
+int lightRaw = -1;
 int previousSoilMoistureRaw = -1;
 int soilStableReadings = 0;
 bool soilStable = false;
 float humidity = NAN;
 float temperatureC = NAN;
+float lightPercent = NAN;
+float soilMoisturePercent = NAN;
+SensorValueState temperatureState;
+SensorValueState humidityState;
+SensorValueState lightState;
+SensorValueState soilState;
 bool pumpRunning = false;
 
 float soilMoisturePercentFromRaw(int reading) {
   return 100.0f - ((reading * 100.0f) / ADC_MAX);
+}
+
+bool sensorWarmupComplete(unsigned long now) {
+  return now >= SENSOR_WARMUP_MS;
+}
+
+float smoothingAlpha() {
+  return constrain(SENSOR_SMOOTHING_ALPHA, 0.0f, 1.0f);
+}
+
+void rejectSensorValue(SensorValueState &state, const char *status) {
+  state.valid = false;
+  state.status = status;
+}
+
+bool sensorValueJumped(const SensorValueState &state, float value) {
+  return state.acceptedSamples >= SENSOR_MIN_VALID_SAMPLES && !isnan(state.lastAcceptedValue) &&
+         fabsf(value - state.lastAcceptedValue) > SENSOR_MAX_PERCENT_STEP;
+}
+
+bool acceptSensorValue(SensorValueState &state, float value) {
+  state.lastAcceptedValue = value;
+
+  if (isnan(state.smoothedValue)) {
+    state.smoothedValue = value;
+  } else {
+    state.smoothedValue += (value - state.smoothedValue) * smoothingAlpha();
+  }
+
+  if (state.acceptedSamples < UINT16_MAX) {
+    state.acceptedSamples++;
+  }
+
+  if (state.acceptedSamples < SENSOR_MIN_VALID_SAMPLES) {
+    rejectSensorValue(state, "settling");
+    return false;
+  }
+
+  state.valid = true;
+  state.status = "ok";
+  return true;
+}
+
+bool updateDhtSensor(SensorValueState &state, float value, unsigned long now, float minimum, float maximum) {
+  if (!sensorWarmupComplete(now)) {
+    rejectSensorValue(state, "warming_up");
+    return false;
+  }
+  if (isnan(value)) {
+    rejectSensorValue(state, "read_failed");
+    return false;
+  }
+  if (value < minimum || value > maximum) {
+    rejectSensorValue(state, "out_of_range");
+    return false;
+  }
+
+  return acceptSensorValue(state, value);
+}
+
+bool updateLightSensor(int raw, unsigned long now) {
+  if (!sensorWarmupComplete(now)) {
+    rejectSensorValue(lightState, "warming_up");
+    return false;
+  }
+
+  const float percent = 100.0f - ((raw * 100.0f) / ADC_MAX);
+  return acceptSensorValue(lightState, constrain(percent, 0.0f, 100.0f));
+}
+
+bool updateSoilSensor(int raw, unsigned long now) {
+  if (!sensorWarmupComplete(now)) {
+    rejectSensorValue(soilState, "warming_up");
+    return false;
+  }
+  if (raw <= SOIL_MIN_VALID_RAW || raw >= SOIL_MAX_VALID_RAW) {
+    rejectSensorValue(soilState, "raw_out_of_range");
+    return false;
+  }
+
+  const float percent = soilMoisturePercentFromRaw(raw);
+  if (percent <= SOIL_MIN_TRUSTED_PERCENT) {
+    rejectSensorValue(soilState, "too_dry_to_trust");
+    return false;
+  }
+  if (sensorValueJumped(soilState, percent)) {
+    rejectSensorValue(soilState, "sudden_change");
+    return false;
+  }
+
+  return acceptSensorValue(soilState, constrain(percent, 0.0f, 100.0f));
+}
+
+int readAveragedAnalog(uint8_t pin, int samples) {
+  const int sampleCount = max(samples, 1);
+  uint32_t total = 0;
+
+  for (int sample = 0; sample < sampleCount; sample++) {
+    total += analogRead(pin);
+    if (sample + 1 < sampleCount) {
+      delayMicroseconds(150);
+    }
+  }
+
+  return total / sampleCount;
 }
 
 void setLedBoard(bool on) {
@@ -111,6 +243,13 @@ int readSoilMoisture() {
 }
 
 void updateSoilStability(int reading) {
+  if (!soilState.valid) {
+    soilStableReadings = 0;
+    soilStable = false;
+    previousSoilMoistureRaw = reading;
+    return;
+  }
+
   if (previousSoilMoistureRaw < 0) {
     previousSoilMoistureRaw = reading;
     soilStableReadings = 1;
@@ -127,6 +266,15 @@ void updateSoilStability(int reading) {
 
   previousSoilMoistureRaw = reading;
   soilStable = soilStableReadings >= SOIL_STABLE_REQUIRED_READINGS;
+}
+
+void printFloatOrPlaceholder(float value, int decimals) {
+  if (isnan(value)) {
+    Serial.print("--.-");
+    return;
+  }
+
+  Serial.print(value, decimals);
 }
 
 void connectWifi() {
@@ -188,22 +336,27 @@ void connectMqtt() {
 }
 
 void publishReading(int lightRaw, int soilMoistureRaw) {
-  const int correctedLightRaw = ADC_MAX - lightRaw;
-  const int correctedSoilMoistureRaw = soilMoistureRaw < 0 ? -1 : ADC_MAX - soilMoistureRaw;
+  const int correctedLightRaw = lightState.valid && lightRaw >= 0 ? ADC_MAX - lightRaw : -1;
+  const int correctedSoilMoistureRaw = soilState.valid && soilMoistureRaw >= 0 ? ADC_MAX - soilMoistureRaw : -1;
 
   const String temperatureJson = isnan(temperatureC) ? "null" : String(temperatureC, 1);
   const String humidityJson = isnan(humidity) ? "null" : String(humidity, 1);
 
-  char payload[220];
+  char payload[420];
   snprintf(
     payload,
     sizeof(payload),
-    "{\"light\":%d,\"soil-moisture\":%d,\"temp\":%s,\"ambient-humidity\":%s,\"soil-stable\":%s}",
+    "{\"light\":%d,\"soil-moisture\":%d,\"temp\":%s,\"ambient-humidity\":%s,\"soil-stable\":%s,"
+    "\"temperature-status\":\"%s\",\"humidity-status\":\"%s\",\"light-status\":\"%s\",\"soil-status\":\"%s\"}",
     correctedLightRaw,
     correctedSoilMoistureRaw,
     temperatureJson.c_str(),
     humidityJson.c_str(),
-    soilStable ? "true" : "false"
+    soilState.valid && soilStable ? "true" : "false",
+    temperatureState.status,
+    humidityState.status,
+    lightState.status,
+    soilState.status
   );
 
   if (mqtt.publish(MQTT_TOPIC, payload)) {
@@ -276,17 +429,27 @@ void loop() {
     const float newHumidity = dht.readHumidity();
     const float newTemperatureC = dht.readTemperature();
 
-    if (!isnan(newHumidity)) {
-      humidity = newHumidity;
+    if (updateDhtSensor(humidityState, newHumidity, now, DHT_MIN_HUMIDITY_PERCENT, DHT_MAX_HUMIDITY_PERCENT)) {
+      humidity = humidityState.smoothedValue;
+    } else {
+      humidity = NAN;
     }
-    if (!isnan(newTemperatureC)) {
-      temperatureC = newTemperatureC;
+
+    if (updateDhtSensor(temperatureState, newTemperatureC, now, DHT_MIN_TEMPERATURE_C, DHT_MAX_TEMPERATURE_C)) {
+      temperatureC = temperatureState.smoothedValue;
+    } else {
+      temperatureC = NAN;
     }
   }
 
   if (now - lastSoilMoistureMs >= SOIL_MOISTURE_INTERVAL_MS || lastSoilMoistureMs == 0) {
     lastSoilMoistureMs = now;
     soilMoistureRaw = readSoilMoisture();
+    if (updateSoilSensor(soilMoistureRaw, now)) {
+      soilMoisturePercent = soilState.smoothedValue;
+    } else {
+      soilMoisturePercent = NAN;
+    }
     updateSoilStability(soilMoistureRaw);
   }
 
@@ -295,38 +458,42 @@ void loop() {
   }
   lastDisplayMs = now;
 
-  const int lightRaw = analogRead(LIGHT_PIN);
-  const float lightPercent = 100.0f - ((lightRaw * 100.0f) / ADC_MAX);
-  const bool ledBoardOn = lightPercent < LED_BOARD_LIGHT_THRESHOLD_PERCENT;
-  const bool fansOn = !isnan(humidity) && humidity > FAN_HUMIDITY_THRESHOLD_PERCENT;
+  lightRaw = readAveragedAnalog(LIGHT_PIN, LIGHT_SAMPLES);
+  if (updateLightSensor(lightRaw, now)) {
+    lightPercent = lightState.smoothedValue;
+  } else {
+    lightPercent = NAN;
+  }
+
+  const bool ledBoardOn = lightState.valid && !isnan(lightPercent) && lightPercent < LED_BOARD_LIGHT_THRESHOLD_PERCENT;
+  const bool fansOn = humidityState.valid && !isnan(humidity) && humidity > FAN_HUMIDITY_THRESHOLD_PERCENT;
 
   setLedBoard(ledBoardOn);
   setFans(fansOn);
 
-  const float soilMoisturePercent = soilMoistureRaw < 0 ? NAN : soilMoisturePercentFromRaw(soilMoistureRaw);
-  const bool pumpShouldRun = soilStable && soilMoisturePercent >= 0.0f && soilMoisturePercent < PUMP_SOIL_THRESHOLD_PERCENT;
+  const bool pumpShouldRun = soilState.valid && soilStable && !isnan(soilMoisturePercent) &&
+                             soilMoisturePercent > SOIL_MIN_TRUSTED_PERCENT &&
+                             soilMoisturePercent < PUMP_SOIL_THRESHOLD_PERCENT;
   updatePump(pumpShouldRun, now);
 
   Serial.print("Temp: ");
-  if (isnan(temperatureC)) {
-    Serial.print("--.- C");
-  } else {
-    Serial.print(temperatureC, 1);
-    Serial.print(" C");
-  }
+  printFloatOrPlaceholder(temperatureC, 1);
+  Serial.print(" C (");
+  Serial.print(temperatureState.status);
+  Serial.print(')');
 
   Serial.print(" | Humidity: ");
-  if (isnan(humidity)) {
-    Serial.print("--.- %");
-  } else {
-    Serial.print(humidity, 1);
-    Serial.print(" %");
-  }
+  printFloatOrPlaceholder(humidity, 1);
+  Serial.print(" % (");
+  Serial.print(humidityState.status);
+  Serial.print(')');
 
   Serial.print(" | Light: ");
-  Serial.print(lightPercent, 1);
+  printFloatOrPlaceholder(lightPercent, 1);
   Serial.print(" % (raw ");
   Serial.print(lightRaw);
+  Serial.print(", ");
+  Serial.print(lightState.status);
   Serial.print(") | LED board: ");
   Serial.print(ledBoardOn ? "ON" : "OFF");
   Serial.print(" | Pump: ");
@@ -337,10 +504,12 @@ void loop() {
   if (soilMoistureRaw < 0) {
     Serial.println("--.- % (sensor off)");
   } else {
-    Serial.print(soilMoisturePercent, 1);
+    printFloatOrPlaceholder(soilMoisturePercent, 1);
     Serial.print(" % (raw ");
     Serial.print(soilMoistureRaw);
-    Serial.print(soilStable ? ", stable, sensor off)" : ", stabilizing, sensor off)");
+    Serial.print(soilStable ? ", stable, " : ", not trusted, ");
+    Serial.print(soilState.status);
+    Serial.print(", sensor off)");
     Serial.println();
   }
 
