@@ -6,6 +6,35 @@ This firmware runs an ESP32-C3 SuperMini as a plant controller.
 
 It reads sensors, controls outputs, prints status over USB serial, and publishes sensor data to MQTT.
 
+## Project Config
+
+Secrets are not stored in `src/main.cpp`.
+
+Firmware loads credentials from:
+
+```cpp
+#if __has_include("plantera_config.h")
+#include "plantera_config.h"
+#else
+#include "plantera_config.example.h"
+#endif
+```
+
+Use this workflow:
+
+```text
+copy include/plantera_config.example.h to include/plantera_config.h
+fill in WiFi and MQTT values locally
+do not commit include/plantera_config.h
+```
+
+`platformio.ini` enables ESP32-C3 native USB serial:
+
+```text
+ARDUINO_USB_MODE=1
+ARDUINO_USB_CDC_ON_BOOT=1
+```
+
 ## Hardware
 
 | Device | ESP32 Pin | Role |
@@ -97,6 +126,7 @@ Read cycle:
 ```text
 turn soil sensor on
 wait 1 second
+take 10 analog readings
 average them
 turn soil sensor off
 ```
@@ -148,6 +178,16 @@ otherwise -> pump OFF
 
 The pump uses PWM on GPIO4.
 
+PWM details:
+
+```text
+channel: 0
+frequency: 20 kHz
+resolution: 8-bit
+soft-start ramp step: 16
+soft-start ramp delay: 40 ms
+```
+
 Current setting:
 
 ```text
@@ -172,6 +212,58 @@ air humidity <= 60% -> fans OFF
 The fans use 12V from the MT3608 boost converter.
 
 Set the MT3608 to 12V with a multimeter before connecting fans.
+
+Fan control does not wait for soil stability. It only depends on DHT22 humidity.
+
+## Boot Behavior
+
+On boot, the firmware:
+
+```text
+starts serial at 115200
+waits 1 second
+sets ADC resolution to 12-bit
+sets pump/fans/LED board off
+sets soil sensor power off
+starts DHT22
+configures insecure TLS MQTT
+blinks the LED board 3 times
+connects WiFi
+connects MQTT
+```
+
+The LED blink is a quick output/MOSFET wiring test.
+
+## Connectivity
+
+WiFi setup:
+
+```text
+station mode
+auto reconnect enabled
+WiFi sleep disabled
+TX power set to 19.5 dBm
+30 second connection timeout
+```
+
+MQTT setup:
+
+```text
+TLS port 8883
+keepalive 30 seconds
+socket timeout 10 seconds
+connect timeout 10 seconds
+```
+
+The firmware calls reconnect logic in the main loop. If WiFi is lost, MQTT is disconnected and the loop waits before retrying.
+
+TLS is currently configured with:
+
+```cpp
+wifiClient.setInsecure();
+```
+
+That encrypts traffic but does not verify the broker certificate.
 
 ## MQTT
 
@@ -205,6 +297,12 @@ Payload:
 }
 ```
 
+If DHT22 has not produced a valid value yet, `temp` or `ambient-humidity` is sent as `null`.
+
+If soil has not been read yet, `soil-moisture` is sent as `-1`.
+
+MQTT publishing does not wait for soil stability. The payload includes `soil-stable` so the broker/UI can decide whether to trust the soil value for decisions.
+
 `light` and `soil-moisture` are corrected raw ADC values:
 
 ```text
@@ -213,6 +311,18 @@ Payload:
 ```
 
 The local `mqtt_subscribe.py` script converts these to percentages.
+
+The helper scripts read MQTT connection values from environment variables:
+
+```text
+MQTT_HOST
+MQTT_PORT
+MQTT_USERNAME
+MQTT_PASSWORD
+MQTT_TOPIC
+```
+
+`mqtt_subscribe.py` displays missing values as `--`.
 
 ## Serial Output
 
@@ -235,6 +345,27 @@ Temp: 21.6 C | Humidity: 51.2 % | Light: 89.3 % (raw 439) | LED board: ON | Pump
 | Light | `< 90%` | LED board ON |
 | Soil moisture | `< 40%` and stable | Pump ON |
 | Air humidity | `> 60%` | Fans ON |
+
+There is no hysteresis implemented yet. Outputs switch directly at their thresholds.
+
+## Firmware Filters And Modifiers
+
+Implemented filters/modifiers:
+
+| Feature | Why it exists |
+| --- | --- |
+| 1 second boot delay | Gives serial/sensors time to start |
+| DHT22 2 second interval | DHT22 cannot be read reliably faster |
+| Soil sensor power cycling | Reduces resistive probe corrosion |
+| Soil 1 second settle delay | Lets sensor output stabilize after power-on |
+| Soil 10-sample average | Reduces ADC noise |
+| Soil stability check | Prevents pump decisions from noisy soil readings |
+| Light inversion | KY-018 raw value is low when bright |
+| Soil inversion | Soil raw value is high when dry |
+| Pump PWM soft-start | Reduces motor startup shock/current spike |
+| MQTT 5 second interval | Avoids publishing every loop |
+| MQTT null/-1 placeholders | Keeps publishing even when some sensors are not ready |
+| WiFi/MQTT reconnect | Recovers from network drops |
 
 ## Soil Calibration
 
