@@ -44,9 +44,9 @@ If your DHT22 board is the bare 4-pin sensor instead of a 3-pin module, add a 4.
 
 The light percentage is corrected so `0%` means dark and `100%` means bright. The LED board turns on when the corrected light reading is below `90%`.
 
-The 5V pump runs continuously when stable soil moisture is below `40%`. It uses PWM soft-start and then runs at full power for testing.
+The 5V pump runs a short watering burst when trusted, stable soil moisture is below `40%`. It uses PWM soft-start and then runs at full power for the bounded burst.
 
-For testing, the pump is currently allowed to run at a `0%` soil moisture reading. Revert this later if `0%` should be treated as a disconnected or invalid sensor reading.
+The pump does not run on suspicious soil readings. `0%`, ADC rail values, readings during sensor warmup, and sudden jumps from the previous trusted value are treated as invalid.
 
 The 12V fans turn on when air humidity from the DHT22 is above `60%`. They turn off at `60%` or below.
 
@@ -64,7 +64,15 @@ The soil moisture percentage is corrected so `0%` means dry and `100%` means wet
 
 To reduce corrosion on resistive soil probes, the soil module's `VCC` is connected to `GPIO3` instead of constant `3V3`. The firmware powers the sensor for 1 second every 5 seconds, averages 10 readings, then turns it off.
 
-Pump control waits until soil moisture is stable. Serial output and MQTT publishing continue while the soil reading is still stabilizing. A soil reading is considered stable after 3 consecutive readings stay within about 1.5% of each other.
+Pump control waits until soil moisture is valid and stable. Serial output and MQTT publishing continue while the soil reading is warming up, settling, or invalid. A soil reading is considered stable after 3 consecutive trusted readings stay within about 1.5% of each other.
+
+## Failsafes
+
+Sensor values warm up for 15 seconds and need 3 accepted samples before they can control outputs. Light readings are averaged before smoothing. Soil readings already use a 10-sample average and are smoothed after validation.
+
+Automatic watering is intentionally conservative. Soil readings at ADC rails, at or below `1%`, or jumping by more than `35%` from the previous trusted value are rejected. Rejected soil readings publish as unavailable and block the pump.
+
+The pump is limited to a 3 second burst, at most 5 seconds per request, with a 60 second minimum off time, a 10 minute watering cooldown, and a 20 second runtime budget per hour. If the soil reading does not increase by at least 2 percentage points or recover to 50% within 2 minutes after watering, automatic watering locks with `pump-status` set to `locked_no_soil_response`.
 
 On boot, the LED board should blink 3 times. If the serial monitor says `LED board: ON` but the LED board is still off, check the MOSFET wiring, shared ground, gate resistor, and 5V supply.
 
@@ -75,7 +83,7 @@ Baud rate: `115200`
 The sketch prints a status line every 0.5 seconds. DHT22 temperature and humidity are refreshed every 2 seconds because the DHT22 cannot be read reliably faster than that.
 
 ```text
-Temp: 23.4 C | Humidity: 45.8 % | Light: 72.1 % (raw 1142) | LED board: ON | Pump: OFF | Fans: OFF | Soil: 64.3 % (raw 1462, sensor off)
+Temp: 23.4 C (ok) | Humidity: 45.8 % (ok) | Light: 72.1 % (raw 1142, ok) | LED board: ON | Pump: OFF (ready) | Fans: OFF | Soil: 64.3 % (raw 1462, stable, ok, sensor off)
 ```
 
 Upload and monitor with:
@@ -122,7 +130,7 @@ curl -X POST http://localhost:8000/api/v1/devices \
 The firmware currently publishes to:
 
 ```text
-iot/devices/1/data
+iot/devices/4/data
 ```
 
-If the registered device ID is not `1`, update `DEVICE_ID` and `MQTT_TOPIC` in `src/main.cpp`.
+If the registered device ID is not `4`, update `MQTT_TOPIC` in `include/plantera_config.h`.

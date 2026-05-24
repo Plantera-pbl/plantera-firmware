@@ -46,7 +46,10 @@ def on_message(client, userdata, message):
         soil_percent = raw_to_percent(data["soil-moisture"])
         temp = data["temp"]
         humidity_percent = data["ambient-humidity"]
-        soil_status = "stable" if data.get("soil-stable") else "stabilizing"
+        soil_stability = "stable" if data.get("soil-stable") else "stabilizing"
+        soil_status = data.get("soil-status", soil_stability)
+        pump_status = data.get("pump-status", "unknown")
+        pump_running = "ON" if data.get("pump-running") else "OFF"
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         print(f"{message.topic} invalid payload: {payload} ({exc})")
         return
@@ -55,7 +58,8 @@ def on_message(client, userdata, message):
         f"Temp: {format_temp(temp)} | "
         f"Air humidity: {format_percent(humidity_percent)} | "
         f"Light: {format_percent(light_percent)} | "
-        f"Soil moisture: {format_percent(soil_percent)} ({soil_status})"
+        f"Soil moisture: {format_percent(soil_percent)} ({soil_stability}, {soil_status}) | "
+        f"Pump: {pump_running} ({pump_status})"
     )
 
 

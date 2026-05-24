@@ -30,6 +30,8 @@ Returns to OK after soil moisture rises above 50%.
 Warn as too wet above 75%.
 ```
 
+The firmware does not water on a `0%` reading, ADC rail values, untrusted sudden jumps, warmup readings, or unsettled soil readings. After watering, it expects the trusted soil reading to increase by at least 2 percentage points or recover above 50% before another automatic watering cycle is allowed.
+
 ## Current Interpretation
 
 A reading around `55%` means the soil is in the good/moist range and the plant does not need watering.

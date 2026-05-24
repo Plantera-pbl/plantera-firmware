@@ -165,16 +165,18 @@ light >= 90% -> LED board OFF
 
 ### Pump
 
-Turns on when stable soil moisture is below 40%.
-
-Current test behavior allows `0%` to trigger the pump.
+Runs one bounded watering burst when trusted, stable soil moisture is below 40%.
 
 Logic:
 
 ```text
-soil stable AND soil moisture >= 0% AND soil moisture < 40% -> pump ON
+soil valid AND soil stable AND soil moisture < 40% -> 3 second pump burst
 otherwise -> pump OFF
 ```
+
+Soil readings are not trusted while warming up, settling, at ADC rails, at or below 1%, or after a sudden jump from the previous trusted value. Those states block automatic watering.
+
+After a burst, automatic watering waits for soil moisture to rise by at least 2 percentage points or recover to 50%. If that does not happen within 2 minutes, automatic watering locks until the soil reading recovers.
 
 The pump uses PWM on GPIO4.
 
@@ -293,7 +295,15 @@ Payload:
   "soil-moisture": 0,
   "temp": 21.6,
   "ambient-humidity": 51.2,
-  "soil-stable": true
+  "soil-stable": true,
+  "temperature-status": "ok",
+  "humidity-status": "ok",
+  "light-status": "ok",
+  "soil-status": "ok",
+  "pump-running": false,
+  "pump-status": "ready",
+  "pump-runtime-ms": 3000,
+  "pump-runtime-budget-ms": 20000
 }
 ```
 
@@ -301,7 +311,7 @@ If DHT22 has not produced a valid value yet, `temp` or `ambient-humidity` is sen
 
 If soil has not been read yet, `soil-moisture` is sent as `-1`.
 
-MQTT publishing does not wait for soil stability. The payload includes `soil-stable` so the broker/UI can decide whether to trust the soil value for decisions.
+MQTT publishing does not wait for soil stability. The payload includes `soil-stable`, per-sensor status fields, and pump safety status so the broker/UI can decide whether to trust values for decisions.
 
 `light` and `soil-moisture` are corrected raw ADC values:
 
@@ -335,7 +345,7 @@ Serial baud:
 Example:
 
 ```text
-Temp: 21.6 C | Humidity: 51.2 % | Light: 89.3 % (raw 439) | LED board: ON | Pump: OFF | Fans: OFF | Soil: 55.3 % (raw 1831, stable, sensor off)
+Temp: 21.6 C (ok) | Humidity: 51.2 % (ok) | Light: 89.3 % (raw 439, ok) | LED board: ON | Pump: OFF (ready) | Fans: OFF | Soil: 55.3 % (raw 1831, stable, ok, sensor off)
 ```
 
 ## Thresholds
@@ -343,10 +353,10 @@ Temp: 21.6 C | Humidity: 51.2 % | Light: 89.3 % (raw 439) | LED board: ON | Pump
 | Thing | Threshold | Action |
 | --- | --- | --- |
 | Light | `< 90%` | LED board ON |
-| Soil moisture | `< 40%` and stable | Pump ON |
+| Soil moisture | `< 40%`, valid, and stable | 3 second pump burst |
 | Air humidity | `> 60%` | Fans ON |
 
-There is no hysteresis implemented yet. Outputs switch directly at their thresholds.
+Pump control also has cooldown, minimum off time, hourly runtime budget, and post-watering soil-response lockout.
 
 ## Firmware Filters And Modifiers
 
@@ -363,6 +373,11 @@ Implemented filters/modifiers:
 | Light inversion | KY-018 raw value is low when bright |
 | Soil inversion | Soil raw value is high when dry |
 | Pump PWM soft-start | Reduces motor startup shock/current spike |
+| Sensor warmup and settling | Blocks actuator decisions before readings are trustworthy |
+| Soil rail and 0% rejection | Avoids watering on disconnected/shorted soil sensors |
+| Sudden soil-change rejection | Avoids acting on impossible sensor jumps |
+| Pump burst/cooldown/runtime budget | Prevents continuous watering when soil stays low |
+| Post-watering response lock | Stops repeated watering if the soil sensor does not react |
 | MQTT 5 second interval | Avoids publishing every loop |
 | MQTT null/-1 placeholders | Keeps publishing even when some sensors are not ready |
 | WiFi/MQTT reconnect | Recovers from network drops |
@@ -435,20 +450,16 @@ too much lift height
 low voltage at pump
 ```
 
-## Current Test Deviations
+## Current Safety Settings
 
-These are temporary test settings:
-
-```text
-pump runs at full PWM
-pump is allowed to run at 0% soil moisture
-pump runs continuously while dry
-```
-
-For safer automatic watering later, revert to:
+Current automatic watering limits:
 
 ```text
-do not pump at 0%
-short pump burst
-10 minute cooldown after watering
+0% soil moisture does not water
+pump burst: 3 seconds
+maximum pump request: 5 seconds
+minimum pump off time: 60 seconds
+watering cooldown: 10 minutes
+hourly pump runtime budget: 20 seconds
+soil response timeout: 2 minutes
 ```
