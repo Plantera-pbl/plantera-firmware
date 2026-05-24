@@ -53,6 +53,15 @@ constexpr float DHT_MAX_TEMPERATURE_C = 80.0f;
 constexpr float DHT_MIN_HUMIDITY_PERCENT = 0.0f;
 constexpr float DHT_MAX_HUMIDITY_PERCENT = 100.0f;
 constexpr float PUMP_SOIL_THRESHOLD_PERCENT = 40.0f;
+constexpr float PUMP_SOIL_RECOVERY_PERCENT = 50.0f;
+constexpr float PUMP_SOIL_RESPONSE_MIN_INCREASE_PERCENT = 2.0f;
+constexpr unsigned long PUMP_WATERING_BURST_MS = 3000;
+constexpr unsigned long PUMP_MAX_RUN_MS = 5000;
+constexpr unsigned long PUMP_MIN_OFF_MS = 60UL * 1000UL;
+constexpr unsigned long PUMP_COOLDOWN_MS = 10UL * 60UL * 1000UL;
+constexpr unsigned long PUMP_SAFETY_WINDOW_MS = 60UL * 60UL * 1000UL;
+constexpr unsigned long PUMP_MAX_RUNTIME_PER_WINDOW_MS = 20000;
+constexpr unsigned long PUMP_SOIL_RESPONSE_TIMEOUT_MS = 2UL * 60UL * 1000UL;
 constexpr float FAN_HUMIDITY_THRESHOLD_PERCENT = 60.0f;
 constexpr float LED_BOARD_LIGHT_THRESHOLD_PERCENT = 90.0f;
 
@@ -71,6 +80,13 @@ unsigned long lastDisplayMs = 0;
 unsigned long lastDhtMs = 0;
 unsigned long lastSoilMoistureMs = 0;
 unsigned long lastMqttPublishMs = 0;
+unsigned long pumpStartedMs = 0;
+unsigned long pumpRunDurationMs = 0;
+unsigned long lastPumpStoppedMs = 0;
+unsigned long lastWateringMs = 0;
+unsigned long pumpBudgetWindowStartedMs = 0;
+unsigned long pumpRuntimeReservedMs = 0;
+unsigned long waterResponseStartedMs = 0;
 int soilMoistureRaw = -1;
 int lightRaw = -1;
 int previousSoilMoistureRaw = -1;
@@ -80,11 +96,15 @@ float humidity = NAN;
 float temperatureC = NAN;
 float lightPercent = NAN;
 float soilMoisturePercent = NAN;
+float waterResponseStartSoilPercent = NAN;
 SensorValueState temperatureState;
 SensorValueState humidityState;
 SensorValueState lightState;
 SensorValueState soilState;
 bool pumpRunning = false;
+bool waitingForSoilResponse = false;
+bool autoWaterLocked = false;
+const char *pumpSafetyStatus = "ready";
 
 float soilMoisturePercentFromRaw(int reading) {
   return 100.0f - ((reading * 100.0f) / ADC_MAX);
@@ -92,6 +112,10 @@ float soilMoisturePercentFromRaw(int reading) {
 
 bool sensorWarmupComplete(unsigned long now) {
   return now >= SENSOR_WARMUP_MS;
+}
+
+bool timeElapsed(unsigned long now, unsigned long since, unsigned long interval) {
+  return since != 0 && now - since >= interval;
 }
 
 float smoothingAlpha() {
@@ -201,6 +225,10 @@ void setLedBoard(bool on) {
 
 void setPump(bool on) {
   if (!on) {
+    if (pumpRunning) {
+      lastPumpStoppedMs = millis();
+      Serial.println("Pump OFF");
+    }
     ledcWrite(PUMP_PWM_CHANNEL, 0);
     pumpRunning = false;
     return;
@@ -217,11 +245,161 @@ void setPump(bool on) {
   }
   ledcWrite(PUMP_PWM_CHANNEL, PUMP_PWM_RUN_DUTY);
   pumpRunning = true;
+  Serial.println("Pump ON");
 }
 
-void updatePump(bool shouldRun, unsigned long now) {
-  (void)now;
-  setPump(shouldRun);
+unsigned long normalizedPumpDuration(unsigned long durationMs) {
+  if (durationMs == 0 || durationMs > PUMP_MAX_RUN_MS) {
+    return PUMP_MAX_RUN_MS;
+  }
+
+  return durationMs;
+}
+
+void refreshPumpBudgetWindow(unsigned long now) {
+  if (pumpBudgetWindowStartedMs == 0 || now - pumpBudgetWindowStartedMs >= PUMP_SAFETY_WINDOW_MS) {
+    pumpBudgetWindowStartedMs = now;
+    pumpRuntimeReservedMs = 0;
+  }
+}
+
+bool soilSensorShowsWateringResponse() {
+  if (!soilState.valid || isnan(soilMoisturePercent) || isnan(waterResponseStartSoilPercent)) {
+    return false;
+  }
+
+  return soilMoisturePercent >= waterResponseStartSoilPercent + PUMP_SOIL_RESPONSE_MIN_INCREASE_PERCENT ||
+         soilMoisturePercent >= PUMP_SOIL_RECOVERY_PERCENT;
+}
+
+void clearWaterResponseWatch(const char *status) {
+  waitingForSoilResponse = false;
+  autoWaterLocked = false;
+  waterResponseStartedMs = 0;
+  waterResponseStartSoilPercent = NAN;
+  pumpSafetyStatus = status;
+}
+
+void startWaterResponseWatch(unsigned long now) {
+  waitingForSoilResponse = true;
+  autoWaterLocked = false;
+  waterResponseStartedMs = now;
+  waterResponseStartSoilPercent = soilMoisturePercent;
+  pumpSafetyStatus = "watering";
+}
+
+void updateWaterResponseSafety(unsigned long now) {
+  if (autoWaterLocked) {
+    if (soilSensorShowsWateringResponse()) {
+      clearWaterResponseWatch("ready");
+      Serial.println("Automatic watering re-enabled after soil response");
+    } else {
+      pumpSafetyStatus = "locked_no_soil_response";
+    }
+    return;
+  }
+
+  if (!waitingForSoilResponse) {
+    return;
+  }
+
+  if (soilSensorShowsWateringResponse()) {
+    clearWaterResponseWatch("ready");
+    Serial.println("Automatic watering re-enabled after soil response");
+    return;
+  }
+
+  if (!soilState.valid || isnan(soilMoisturePercent)) {
+    pumpSafetyStatus = "waiting_for_valid_soil";
+    return;
+  }
+
+  if (timeElapsed(now, waterResponseStartedMs, PUMP_SOIL_RESPONSE_TIMEOUT_MS)) {
+    waitingForSoilResponse = false;
+    autoWaterLocked = true;
+    pumpSafetyStatus = "locked_no_soil_response";
+    Serial.println("Automatic watering locked: soil did not respond after pump run");
+    return;
+  }
+
+  pumpSafetyStatus = "waiting_for_soil_response";
+}
+
+void stopPump(const char *status) {
+  pumpRunDurationMs = 0;
+  setPump(false);
+  pumpSafetyStatus = status;
+}
+
+void servicePump(unsigned long now) {
+  if (!pumpRunning) {
+    return;
+  }
+
+  if (!soilState.valid || isnan(soilMoisturePercent)) {
+    stopPump("stopped_soil_invalid");
+    return;
+  }
+
+  if (timeElapsed(now, pumpStartedMs, pumpRunDurationMs)) {
+    stopPump(waitingForSoilResponse ? "waiting_for_soil_response" : "ready");
+  }
+}
+
+bool pumpRuntimeAvailable(unsigned long now, unsigned long durationMs) {
+  refreshPumpBudgetWindow(now);
+  return pumpRuntimeReservedMs + durationMs <= PUMP_MAX_RUNTIME_PER_WINDOW_MS;
+}
+
+bool canStartAutomaticWatering(unsigned long now, unsigned long durationMs) {
+  updateWaterResponseSafety(now);
+
+  if (pumpRunning || waitingForSoilResponse || autoWaterLocked) {
+    return false;
+  }
+  if (!soilState.valid || !soilStable || isnan(soilMoisturePercent)) {
+    pumpSafetyStatus = soilState.valid ? "soil_stabilizing" : soilState.status;
+    return false;
+  }
+  if (soilMoisturePercent >= PUMP_SOIL_THRESHOLD_PERCENT) {
+    pumpSafetyStatus = "ready";
+    return false;
+  }
+  if (lastWateringMs != 0 && now - lastWateringMs < PUMP_COOLDOWN_MS) {
+    pumpSafetyStatus = "cooldown";
+    return false;
+  }
+  if (lastPumpStoppedMs != 0 && now - lastPumpStoppedMs < PUMP_MIN_OFF_MS) {
+    pumpSafetyStatus = "minimum_off_time";
+    return false;
+  }
+  if (!pumpRuntimeAvailable(now, durationMs)) {
+    pumpSafetyStatus = "runtime_budget_exceeded";
+    return false;
+  }
+
+  return true;
+}
+
+bool requestPumpRun(unsigned long durationMs, const char *reason, unsigned long now) {
+  const unsigned long safeDurationMs = normalizedPumpDuration(durationMs);
+  if (!canStartAutomaticWatering(now, safeDurationMs)) {
+    return false;
+  }
+
+  pumpStartedMs = now;
+  pumpRunDurationMs = safeDurationMs;
+  lastWateringMs = now;
+  pumpRuntimeReservedMs += safeDurationMs;
+  pumpSafetyStatus = "watering";
+
+  Serial.print("Pump requested for ");
+  Serial.print(safeDurationMs);
+  Serial.print(" ms by ");
+  Serial.println(reason);
+
+  setPump(true);
+  return true;
 }
 
 void setFans(bool on) {
@@ -336,18 +514,21 @@ void connectMqtt() {
 }
 
 void publishReading(int lightRaw, int soilMoistureRaw) {
+  refreshPumpBudgetWindow(millis());
+
   const int correctedLightRaw = lightState.valid && lightRaw >= 0 ? ADC_MAX - lightRaw : -1;
   const int correctedSoilMoistureRaw = soilState.valid && soilMoistureRaw >= 0 ? ADC_MAX - soilMoistureRaw : -1;
 
   const String temperatureJson = isnan(temperatureC) ? "null" : String(temperatureC, 1);
   const String humidityJson = isnan(humidity) ? "null" : String(humidity, 1);
 
-  char payload[420];
+  char payload[560];
   snprintf(
     payload,
     sizeof(payload),
     "{\"light\":%d,\"soil-moisture\":%d,\"temp\":%s,\"ambient-humidity\":%s,\"soil-stable\":%s,"
-    "\"temperature-status\":\"%s\",\"humidity-status\":\"%s\",\"light-status\":\"%s\",\"soil-status\":\"%s\"}",
+    "\"temperature-status\":\"%s\",\"humidity-status\":\"%s\",\"light-status\":\"%s\",\"soil-status\":\"%s\","
+    "\"pump-running\":%s,\"pump-status\":\"%s\",\"pump-runtime-ms\":%lu,\"pump-runtime-budget-ms\":%lu}",
     correctedLightRaw,
     correctedSoilMoistureRaw,
     temperatureJson.c_str(),
@@ -356,7 +537,11 @@ void publishReading(int lightRaw, int soilMoistureRaw) {
     temperatureState.status,
     humidityState.status,
     lightState.status,
-    soilState.status
+    soilState.status,
+    pumpRunning ? "true" : "false",
+    pumpSafetyStatus,
+    pumpRuntimeReservedMs,
+    PUMP_MAX_RUNTIME_PER_WINDOW_MS
   );
 
   if (mqtt.publish(MQTT_TOPIC, payload)) {
@@ -393,7 +578,7 @@ void setup() {
   Serial.println(MQTT_TOPIC);
   Serial.println("Light is corrected so 0% = dark and 100% = bright.");
   Serial.println("5V LED board turns on when corrected light is under 90%.");
-  Serial.println("5V pump runs continuously when stable soil moisture is under 40%, using PWM soft-start and full run power.");
+  Serial.println("5V pump uses short safe bursts when trusted stable soil moisture is under 40%.");
   Serial.println("12V fans turn on when air humidity is over 60%.");
   Serial.println();
 
@@ -409,7 +594,12 @@ void setup() {
 }
 
 void loop() {
-  const unsigned long now = millis();
+  unsigned long now = millis();
+
+  servicePump(now);
+  if ((WiFi.status() != WL_CONNECTED || !mqtt.connected()) && pumpRunning) {
+    stopPump("stopped_network_reconnect");
+  }
 
   connectWifi();
   if (WiFi.status() != WL_CONNECTED) {
@@ -422,6 +612,9 @@ void loop() {
 
   connectMqtt();
   mqtt.loop();
+  now = millis();
+  servicePump(now);
+  updateWaterResponseSafety(now);
 
   if (now - lastDhtMs >= DHT_INTERVAL_MS || lastDhtMs == 0) {
     lastDhtMs = now;
@@ -451,6 +644,7 @@ void loop() {
       soilMoisturePercent = NAN;
     }
     updateSoilStability(soilMoistureRaw);
+    updateWaterResponseSafety(now);
   }
 
   if (now - lastDisplayMs < DISPLAY_INTERVAL_MS) {
@@ -471,10 +665,9 @@ void loop() {
   setLedBoard(ledBoardOn);
   setFans(fansOn);
 
-  const bool pumpShouldRun = soilState.valid && soilStable && !isnan(soilMoisturePercent) &&
-                             soilMoisturePercent > SOIL_MIN_TRUSTED_PERCENT &&
-                             soilMoisturePercent < PUMP_SOIL_THRESHOLD_PERCENT;
-  updatePump(pumpShouldRun, now);
+  if (requestPumpRun(PUMP_WATERING_BURST_MS, "auto-soil", now)) {
+    startWaterResponseWatch(now);
+  }
 
   Serial.print("Temp: ");
   printFloatOrPlaceholder(temperatureC, 1);
@@ -498,6 +691,9 @@ void loop() {
   Serial.print(ledBoardOn ? "ON" : "OFF");
   Serial.print(" | Pump: ");
   Serial.print(pumpRunning ? "ON" : "OFF");
+  Serial.print(" (");
+  Serial.print(pumpSafetyStatus);
+  Serial.print(')');
   Serial.print(" | Fans: ");
   Serial.print(fansOn ? "ON" : "OFF");
   Serial.print(" | Soil: ");
