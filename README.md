@@ -42,6 +42,8 @@ PlatformIO Arduino firmware for an ESP32-C3 SuperMini, DHT22, and 3-pin KY-018 l
 
 If your DHT22 board is the bare 4-pin sensor instead of a 3-pin module, add a 4.7k to 10k pull-up resistor between DATA and 3V3.
 
+WiFi can be configured with multiple networks in `include/plantera_config.h`. On connection failure, the ESP rotates through the list, for example `Riki -> StarNet -> Riki`.
+
 The light percentage is corrected so `0%` means dark and `100%` means bright. The LED board turns on when the corrected light reading is below `90%`.
 
 The 5V pump runs a short watering burst when trusted, stable soil moisture is below `40%`. It uses PWM soft-start and then runs at full power for the bounded burst.
@@ -72,7 +74,7 @@ Sensor values warm up for 15 seconds and need 3 accepted samples before they can
 
 Automatic watering is intentionally conservative. Soil readings at ADC rails, at or below `1%`, or jumping by more than `35%` from the previous trusted value are rejected. Rejected soil readings publish as unavailable and block the pump.
 
-The pump is limited to a 3 second burst, at most 5 seconds per request, with a 60 second minimum off time, a 10 minute watering cooldown, and a 20 second runtime budget per hour. If the soil reading does not increase by at least 2 percentage points or recover to 50% within 2 minutes after watering, automatic watering locks with `pump-status` set to `locked_no_soil_response`.
+The pump uses the configured watering duration, then enters the configured cooldown. A 60 second minimum off time remains as a short hardware protection gap.
 
 On boot, the LED board should blink 3 times. If the serial monitor says `LED board: ON` but the LED board is still off, check the MOSFET wiring, shared ground, gate resistor, and 5V supply.
 
@@ -134,3 +136,31 @@ iot/devices/4/data
 ```
 
 If the registered device ID is not `4`, update `MQTT_TOPIC` in `include/plantera_config.h`.
+
+The firmware also subscribes to config updates on:
+
+```text
+iot/devices/4/config
+```
+
+Supported config payload:
+
+```json
+{
+  "device_state": 1,
+  "watering_cooldown": 10,
+  "watering_moisture_threshold_on": 40,
+  "watering_moisture_threshold_off": 50,
+  "watering_duration": 3,
+  "fan_humidity_threshold_on": 60,
+  "fan_humidity_threshold_off": 55,
+  "light_intensity_threshold_on": 90,
+  "light_intensity_threshold_off": 95,
+  "timezone_offset_minutes": 120,
+  "non_working_windows": [
+    { "start": "22:00", "end": "07:00" }
+  ]
+}
+```
+
+Config values are kept in RAM and apply immediately after the MQTT message is received. Publish the config as a retained MQTT message if the ESP should receive it after reboot.

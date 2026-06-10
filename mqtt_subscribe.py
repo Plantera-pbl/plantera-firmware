@@ -5,11 +5,31 @@ import ssl
 import paho.mqtt.client as mqtt
 
 
+def load_dotenv(path=".env"):
+    if not os.path.exists(path):
+        return
+
+    with open(path, "r", encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().split()[0])
+
+
+load_dotenv()
+
 MQTT_HOST = os.getenv("MQTT_HOST", "")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
 MQTT_USERNAME = os.getenv("MQTT_USERNAME", "")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
 MQTT_TOPIC = os.getenv("MQTT_TOPIC", "iot/devices/4/data")
+MQTT_CONFIG_TOPIC = os.getenv(
+    "MQTT_CONFIG_TOPIC",
+    MQTT_TOPIC.removesuffix("/data") + "/config" if MQTT_TOPIC.endswith("/data") else "iot/devices/4/config",
+)
 ADC_MAX = 4095
 
 
@@ -33,12 +53,22 @@ def format_temp(value):
 
 def on_connect(client, userdata, flags, reason_code, properties=None):
     print(f"connected: {reason_code}")
-    client.subscribe(MQTT_TOPIC)
+    client.subscribe([(MQTT_TOPIC, 0), (MQTT_CONFIG_TOPIC, 0)])
     print(f"subscribed: {MQTT_TOPIC}")
+    print(f"subscribed: {MQTT_CONFIG_TOPIC}")
 
 
 def on_message(client, userdata, message):
     payload = message.payload.decode("utf-8", errors="replace")
+
+    if message.topic == MQTT_CONFIG_TOPIC:
+        try:
+            config = json.loads(payload)
+            pretty = json.dumps(config, sort_keys=True)
+        except json.JSONDecodeError:
+            pretty = payload
+        print(f"CONFIG retain={message.retain}: {pretty}")
+        return
 
     try:
         data = json.loads(payload)

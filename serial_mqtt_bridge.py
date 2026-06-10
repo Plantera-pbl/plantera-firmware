@@ -12,6 +12,22 @@ import paho.mqtt.client as mqtt
 import serial
 
 
+def load_dotenv(path=".env"):
+    if not os.path.exists(path):
+        return
+
+    with open(path, "r", encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().split()[0])
+
+
+load_dotenv()
+
 MQTT_HOST = os.getenv("MQTT_HOST", "")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
 MQTT_USERNAME = os.getenv("MQTT_USERNAME", "")
